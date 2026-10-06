@@ -14,6 +14,7 @@
 #     <engine> filter  <csv> <col> <op> <value>        (op: == != < <= > >=)
 #     <engine> agg     <csv> <func> <col>              (func: sum count avg min max)
 #     <engine> groupby <csv> <groupcol> <func> <aggcol>
+#     <engine> pipeline <csv> <stage> [<stage> ...]    (Stage 7; contract there)
 #
 #  Output contract:
 #     schema  -> a line "rows: <N>", then one "<name>:<type>" per column
@@ -278,6 +279,181 @@ try:
         bad(f"avg disagrees with pandas: pandas={df['val'].mean():.4f}, engine={out.strip()!r}")
 except ImportError:
     skip("pandas not installed; install it (pip install pandas) to cross-validate on real data")
+
+# ============================================================
+#  STAGE 7 -- operator composition (roadmap Week 6)
+# ============================================================
+#  Contract:
+#     <engine> pipeline <csv> <stage> [<stage> ...]
+#  stages, left to right = bottom to top of the operator chain:
+#     filter  <col> <op> <value>          repeatable; multiple filters = AND
+#     select  <col1,col2,...> <limit>     terminal
+#     agg     <func> <col>                terminal
+#     groupby <groupcol> <func> <aggcol>  terminal
+#  Output = whatever the terminal stage prints in the single-command
+#  contract. No terminal stage (filters only) -> "count: <N>".
+#  Empty input to a terminal (nothing passed the filters):
+#     agg count -> 0;  agg sum/avg/min/max -> exit 0 and print NO number
+#     (e.g. "NULL");  groupby -> exit 0 with no group lines;
+#     select -> exit 0 with no lines.  It must never crash.
+# ============================================================
+hdr("Stage 7: operator composition (pipeline)")
+
+OPS = {"==": lambda a, b: a == b, "!=": lambda a, b: a != b,
+       "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+       ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
+CI = {name: i for i, name in enumerate(HEADER)}
+
+def ref_rows(filters, rows=ROWS):
+    """reference: rows surviving every (col, op, value) filter, in order"""
+    out = rows
+    for c, op, v in filters:
+        out = [r for r in out if OPS[op](r[CI[c]], v)]
+    return out
+
+def ref_agg(func, vals):
+    if func == "count": return float(len(vals))
+    if not vals: return None
+    return {"sum": sum(vals), "avg": sum(vals) / len(vals),
+            "min": min(vals), "max": max(vals)}[func]
+
+def ref_groupby(rows, gcol, func, acol):
+    g = {}
+    for r in rows:
+        g.setdefault(str(r[CI[gcol]]), []).append(r[CI[acol]])
+    return {k: ref_agg(func, v) for k, v in g.items()}
+
+def pipe_args(filters, terminal, csv_path=MAIN_CSV):
+    a = ["pipeline", csv_path]
+    for c, op, v in filters:
+        a += ["filter", c, op, f"{v:g}"]
+    return a + terminal
+
+def describe(filters, terminal):
+    parts = ["scan"] + [f"filter {c} {op} {v:g}" for c, op, v in filters]
+    return " -> ".join(parts + ([" ".join(terminal)] if terminal else []))
+
+def t_count(filters):
+    args = pipe_args(filters, [])
+    out, good = run(args)
+    want = len(ref_rows(filters))
+    m = re.search(r"count\s*[:=]?\s*(\d+)", out, re.I)
+    got = int(m.group(1)) if m else None
+    if good and got == want: ok(f"{describe(filters, [])}  ->  count {want}")
+    else: bad(f"{describe(filters, [])}: want count {want}, got {out.strip()!r}"
+              + ("" if good else "  (non-zero exit / crash)"))
+
+def t_agg(filters, func, col):
+    term = ["agg", func, col]
+    out, good = run(pipe_args(filters, term))
+    want = ref_agg(func, [r[CI[col]] for r in ref_rows(filters)])
+    ns = nums(out)
+    if want is None:
+        passed_ = good and not ns
+        wdesc = "no number (empty input)"
+    else:
+        passed_ = good and bool(ns) and approx(ns[-1], want)
+        wdesc = f"{want:g}"
+    if passed_: ok(f"{describe(filters, term)}  ->  {wdesc}")
+    else: bad(f"{describe(filters, term)}: want {wdesc}, got {out.strip()!r}"
+              + ("" if good else "  (non-zero exit / crash)"))
+
+def t_groupby(filters, gcol, func, acol):
+    term = ["groupby", gcol, func, acol]
+    out, good = run(pipe_args(filters, term))
+    want = ref_groupby(ref_rows(filters), gcol, func, acol)
+    got = parse_groups(out)
+    passed_ = good and len(got) == len(want) and \
+        all(k in got and approx(got[k], v) for k, v in want.items())
+    wdesc = ", ".join(f"{k}={v:g}" for k, v in want.items()) or "no groups"
+    if passed_: ok(f"{describe(filters, term)}  ->  {wdesc}")
+    else: bad(f"{describe(filters, term)}: want {{{wdesc}}}, got {got}\nraw:\n{out.strip()}"
+              + ("" if good else "\n  (non-zero exit / crash)"))
+
+def t_select(filters, cols, limit):
+    term = ["select", ",".join(cols), str(limit)]
+    out, good = run(pipe_args(filters, term))
+    want = ref_rows(filters)[:limit]
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    rows_ok = len(lines) == len(want)
+    if rows_ok:
+        for ln, r in zip(lines, want):
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) != len(cols): rows_ok = False; break
+            for p, c in zip(parts, cols):
+                v = r[CI[c]]
+                if isinstance(v, str):
+                    if p != v: rows_ok = False
+                else:
+                    try:
+                        if not approx(float(p), float(v)): rows_ok = False
+                    except ValueError:
+                        rows_ok = False
+    if good and rows_ok:
+        ok(f"{describe(filters, term)}  ->  {len(want)} rows, correct and in order")
+    else:
+        bad(f"{describe(filters, term)}: want {len(want)} rows {[[r[CI[c]] for c in cols] for r in want]}, got:\n{out.strip()}"
+            + ("" if good else "\n  (non-zero exit / crash)"))
+
+F1 = [("fare_amount", ">", 15)]                                   # ids 2,3,4,6
+F2 = [("fare_amount", ">", 15), ("passenger_count", "<=", 2)]     # ids 2,3,6
+NONE = [("fare_amount", ">", 1000)]                               # nothing
+
+print("  -- filters only")
+t_count(F1)
+t_count(F2)
+t_count(NONE)
+
+print("  -- filter -> agg")
+for func in ["sum", "count", "avg", "min", "max"]:
+    t_agg(F1, func, "fare_amount")
+t_agg(F2, "sum", "fare_amount")
+
+print("  -- filter -> groupby")
+for func in ["sum", "count", "min", "max"]:
+    t_groupby(F1, "payment_type", func, "fare_amount")
+t_groupby(F2, "payment_type", "sum", "fare_amount")
+t_groupby(F1, "passenger_count", "sum", "fare_amount")            # integer group key
+
+print("  -- filter -> select")
+t_select(F1, ["id", "payment_type"], 3)
+t_select(F2, ["payment_type", "fare_amount"], 10)                 # limit > matches
+
+print("  -- nothing passes the filter")
+for func in ["count", "sum", "max"]:
+    t_agg(NONE, func, "fare_amount")
+t_groupby(NONE, "payment_type", "sum", "fare_amount")
+t_select(NONE, ["id"], 3)
+
+# ---- larger data, crosses batch boundaries; pure-Python reference ----
+print("  -- larger data (crosses batch boundaries)")
+random.seed(7)
+BIG7 = os.path.join(_tmpdir, "big7.csv")
+big_rows = [[random.choice(["A", "B", "C", "D"]), round(random.uniform(0, 100), 2),
+             random.randint(1, 5)] for _ in range(10000)]
+with open(BIG7, "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["cat", "val", "grp"]); w.writerows(big_rows)
+bci = {"cat": 0, "val": 1, "grp": 2}
+surv = [r for r in big_rows if r[1] > 50 and r[2] <= 3]
+args = ["pipeline", BIG7, "filter", "val", ">", "50", "filter", "grp", "<=", "3",
+        "groupby", "cat", "sum", "val"]
+out, good = run(args)
+want = {}
+for r in surv: want[r[0]] = want.get(r[0], 0.0) + r[1]
+got = parse_groups(out)
+if good and len(got) == len(want) and all(k in got and approx(got[k], v, tol=1e-2) for k, v in want.items()):
+    ok(f"10k rows: filter val > 50 -> filter grp <= 3 -> groupby cat sum val ({len(surv)} rows survive)")
+else:
+    bad(f"10k-row composed groupby wrong.\n  want: {want}\n  got:  {got}")
+
+args = ["pipeline", BIG7, "filter", "val", ">", "99", "agg", "min", "val"]
+out, good = run(args)
+lo = [r[1] for r in big_rows if r[1] > 99]
+ns = nums(out)
+if good and ns and approx(ns[-1], min(lo)):
+    ok(f"10k rows: filter val > 99 -> agg min val (sparse matches across batches) -> {min(lo):g}")
+else:
+    bad(f"10k rows: filter val > 99 -> agg min: want {min(lo):g}, got {out.strip()!r}")
 
 # ============================================================
 #  SUMMARY

@@ -126,6 +126,16 @@ bool AggOp::next(Batch &out) {
         cd);
   }
 
+  if (ans.size() == 0) {
+    if (func == "count") {
+      std::vector<double> vec{0};
+      out.columns.push_back(std::move(vec));
+      out.size = 1;
+    }
+    already_emitted = true;
+    return true;
+  }
+
   double result{};
   if (func == "sum") {
     result = std::accumulate(ans.begin(), ans.end(), 0.0);
@@ -228,7 +238,6 @@ void GroupByOp::AggState::update(double value) {
 }
 
 bool GroupByOp::next(Batch &out) {
-
   if (already_emitted)
     return false;
   Batch in;
@@ -263,6 +272,13 @@ bool GroupByOp::next(Batch &out) {
           }
         },
         gc, ac);
+  }
+
+  if (running_state.size() == 0) {
+    out.columns.clear();
+    out.size = 0;
+    already_emitted = true;
+    return true;
   }
 
   std::vector<double> answers;
