@@ -36,26 +36,9 @@ struct FilterOp : Operator {
   std::function<bool(double)> pred;
   size_t index;
 
-  FilterOp(std::unique_ptr<Operator> child, size_t index, std::string op_string,
-           double limit)
+  FilterOp(std::unique_ptr<Operator> child, size_t index,
+           std::function<bool(double, double)> op, double limit)
       : child(std::move(child)), index(index) {
-    std::function<bool(double, double)> op;
-    if (op_string == "==") {
-      op = std::equal_to<>{};
-    } else if (op_string == "!=") {
-      op = std::not_equal_to<>{};
-    } else if (op_string == "<") {
-      op = std::less<>{};
-    } else if (op_string == "<=") {
-      op = std::less_equal<>{};
-    } else if (op_string == ">") {
-      op = std::greater<>{};
-    } else if (op_string == ">=") {
-      op = std::greater_equal<>{};
-    } else {
-      std::cerr << "Error: Invalid operation\n";
-      return;
-    }
     pred = [=](double d) { return op(d, limit); };
   }
   bool next(Batch &out) override;

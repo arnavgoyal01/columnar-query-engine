@@ -1,6 +1,7 @@
 #include "operator.h"
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <grp.h>
 #include <iomanip>
 #include <iostream>
@@ -222,6 +223,7 @@ void LimitOp::open() { child->open(); }
 void LimitOp::close() { child->close(); }
 
 void GroupByOp::open() {
+  running_state.clear();
   already_emitted = false;
   child->open();
 }
@@ -245,8 +247,8 @@ bool GroupByOp::next(Batch &out) {
   out.size = 0;
 
   while (child->next(in)) {
-    auto gc = in.columns[group_id];
-    auto ac = in.columns[agg_id];
+    auto &gc = in.columns[group_id];
+    auto &ac = in.columns[agg_id];
     std::visit(
         [&](const auto &keys, const auto &vals) {
           using K = typename std::decay_t<decltype(keys)>::value_type;
@@ -282,25 +284,29 @@ bool GroupByOp::next(Batch &out) {
   }
 
   std::vector<double> answers;
+  answers.reserve(running_state.size());
+  std::function<double(AggState *)> getValue;
+  if (func == "count") {
+    getValue = [](AggState *agg) { return agg->count; };
+  } else if (func == "sum") {
+    getValue = [](AggState *agg) { return agg->sum; };
+  } else if (func == "avg") {
+    getValue = [](AggState *agg) { return agg->sum / agg->count; };
+  } else if (func == "min") {
+    getValue = [](AggState *agg) { return agg->min; };
+  } else if (func == "max") {
+    getValue = [](AggState *agg) { return agg->max; };
+  } else {
+    std::cerr << "Error: Invalid func\n";
+  }
+
   std::visit(
       [&](auto &groups) {
         using K = typename std::decay_t<decltype(groups)>::value_type;
         out.size = running_state.size();
         for (auto &[g, as] : running_state) {
           groups.push_back(std::get<K>(g));
-          if (func == "count") {
-            answers.push_back(as.count);
-          } else if (func == "sum") {
-            answers.push_back(as.sum);
-          } else if (func == "avg") {
-            answers.push_back(as.sum / as.count);
-          } else if (func == "min") {
-            answers.push_back(as.min);
-          } else if (func == "max") {
-            answers.push_back(as.max);
-          } else {
-            std::cerr << "Error: Invalid func\n";
-          }
+          answers.push_back(getValue(&as));
         }
       },
       out.columns[0]);

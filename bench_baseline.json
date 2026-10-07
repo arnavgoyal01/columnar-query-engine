@@ -1,5 +1,13 @@
 {
-  "groupby cat sum val": 1.9164374864994898,
-  "agg sum val": 1.7633679190003022,
-  "filter val > 50": 1.7640615224991052
+  "format": 2,
+  "query_ms": {
+    "groupby cat sum val": 316.9015,
+    "agg sum val": 22.03005,
+    "filter val > 50": 77.76875
+  },
+  "wall_s": {
+    "groupby cat sum val": 2.009687492500234,
+    "agg sum val": 1.6231899250014976,
+    "filter val > 50": 1.8577125154952228
+  }
 }

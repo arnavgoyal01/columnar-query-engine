@@ -140,6 +140,10 @@ void schema(const Table &table, std::string &output);
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     std::cerr << "Error: command not provided\n";
+    return 1;
+  } else if (argc == 2) {
+    std::cerr << "Error: file required\n";
+    return 1;
   }
 
   std::string filename = argv[2];
@@ -206,10 +210,16 @@ int main(int argc, char *argv[]) {
 
   // SELECT
   else if (std::string_view(argv[1]) == "select") {
+    if (4 >= argc) {
+      std::cerr << "Error: incomplete command\n";
+      return 1;
+    }
+
     if (!check_datatype<int64_t>(std::string_view(argv[argc - 1]))) {
       std::cerr << "Error: last argument needs to be an integer\n";
       return 1;
     }
+
     std::string cols{argv[3]};
     std::vector<size_t> cols_index;
     auto start = 0;
@@ -259,6 +269,11 @@ int main(int argc, char *argv[]) {
 
   // FILTER
   else if (std::string_view(argv[1]) == "filter") {
+    if (5 >= argc) {
+      std::cerr << "Error: incomplete command\n";
+      return 1;
+    }
+
     if (!check_datatype<double>(std::string_view(argv[argc - 1]))) {
       std::cerr << "Error: last argument needs to be an integer\n";
       return 1;
@@ -267,11 +282,27 @@ int main(int argc, char *argv[]) {
     std::string colname = std::string(argv[3]);
     auto index = table_schema[colname];
     auto op_string = std::string(argv[4]);
+    std::function<bool(double, double)> op;
+    if (op_string == "==") {
+      op = std::equal_to<>{};
+    } else if (op_string == "!=") {
+      op = std::not_equal_to<>{};
+    } else if (op_string == "<") {
+      op = std::less<>{};
+    } else if (op_string == "<=") {
+      op = std::less_equal<>{};
+    } else if (op_string == ">") {
+      op = std::greater<>{};
+    } else if (op_string == ">=") {
+      op = std::greater_equal<>{};
+    } else {
+      std::cerr << "Error: Invalid operation\n";
+      return 1;
+    }
     auto limit = std::stod(std::string(argv[5]));
 
     auto scan = std::make_unique<ScanOp>(table);
-    auto filter =
-        std::make_unique<FilterOp>(std::move(scan), index, op_string, limit);
+    auto filter = std::make_unique<FilterOp>(std::move(scan), index, op, limit);
     filter->open();
     auto count{0};
     Batch in;
@@ -285,9 +316,13 @@ int main(int argc, char *argv[]) {
 
   // AGG
   else if (std::string_view(argv[1]) == "agg") {
+    if (4 >= argc) {
+      std::cerr << "Error: incomplete command\n";
+      return 1;
+    }
+
     std::string colname{argv[4]};
     std::string func{argv[3]};
-
     auto scan = std::make_unique<ScanOp>(table);
     auto agg =
         std::make_unique<AggOp>(std::move(scan), func, table_schema[colname]);
@@ -313,6 +348,10 @@ int main(int argc, char *argv[]) {
 
   //  GROUPBY
   else if (std::string_view(argv[1]) == "groupby") {
+    if (5 >= argc) {
+      std::cerr << "Error: incomplete command\n";
+      return 1;
+    }
     auto groupcol = std::string(argv[3]);
     auto group_id = table_schema[groupcol];
     auto aggcol = std::string(argv[5]);
@@ -357,7 +396,7 @@ int main(int argc, char *argv[]) {
 
               std::ostringstream oss;
               oss << std::fixed << std::setprecision(10) << ans[i];
-              output += oss.str();
+              output += " " + oss.str();
               output += "\n";
             }
           }
@@ -367,25 +406,58 @@ int main(int argc, char *argv[]) {
   }
 
   else if (std::string_view(argv[1]) == "pipeline") {
+    if (argc < 2) {
+      std::cerr << "Error: Incomplete pipeline command\n";
+      return 1;
+    } else if (argc <= 2) {
+      std::cout << "count: " << table[0].length << "\n";
+      return 1;
+    }
     std::unique_ptr<Operator> root;
     root = std::make_unique<ScanOp>(table);
     std::string terminal{};
     int i{3};
     while (i < argc) {
       if (std::string_view(argv[i]) == "filter") {
+        if (i + 3 >= argc) {
+          std::cerr << "Error: incomplete command\n";
+          return 1;
+        }
+
         if (!check_datatype<double>(std::string_view(argv[i + 3]))) {
-          // std::cerr << "Error: last argument needs to be numeric\n";
+          std::cerr << "Error: last argument needs to be numeric\n";
           return 1;
         }
 
         std::string colname = std::string(argv[i + 1]);
         auto index = table_schema[colname];
         auto op_string = std::string(argv[i + 2]);
+        std::function<bool(double, double)> op;
+        if (op_string == "==") {
+          op = std::equal_to<>{};
+        } else if (op_string == "!=") {
+          op = std::not_equal_to<>{};
+        } else if (op_string == "<") {
+          op = std::less<>{};
+        } else if (op_string == "<=") {
+          op = std::less_equal<>{};
+        } else if (op_string == ">") {
+          op = std::greater<>{};
+        } else if (op_string == ">=") {
+          op = std::greater_equal<>{};
+        } else {
+          std::cerr << "Error: Invalid operation\n";
+          return 1;
+        }
         auto limit = std::stod(std::string(argv[i + 3]));
-        root = std::make_unique<FilterOp>(std::move(root), index, op_string,
-                                          limit);
+        root = std::make_unique<FilterOp>(std::move(root), index, op, limit);
         i += 4;
       } else if (std::string_view(argv[i]) == "agg") {
+        if (i + 2 >= argc) {
+          std::cerr << "Error: incomplete command\n";
+          return 1;
+        }
+
         std::string colname{argv[i + 2]};
         std::string func{argv[i + 1]};
 
@@ -395,6 +467,11 @@ int main(int argc, char *argv[]) {
         i += 3;
         break;
       } else if (std::string_view(argv[i]) == "select") {
+        if (i + 2 >= argc) {
+          std::cerr << "Error: incomplete command\n";
+          return 1;
+        }
+
         if (!check_datatype<int64_t>(std::string_view(argv[i + 2]))) {
           std::cerr << "Error: last argument needs to be an integer\n";
           return 1;
@@ -422,6 +499,11 @@ int main(int argc, char *argv[]) {
         i += 3;
         break;
       } else if (std::string_view(argv[i]) == "groupby") {
+        if (i + 3 >= argc) {
+          std::cerr << "Error: incomplete command\n";
+          return 1;
+        }
+
         auto groupcol = std::string(argv[i + 1]);
         auto group_id = table_schema[groupcol];
         auto aggcol = std::string(argv[i + 3]);
@@ -552,7 +634,7 @@ int main(int argc, char *argv[]) {
   }
   auto finish = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> duration = finish - begin;
-  std::cerr << "QUERY_MS: " << duration.count();
+  std::cerr << "QUERY_MS: " << duration.count() << "\n";
   if (output != "") {
     std::cout << output;
   }
@@ -568,177 +650,3 @@ void schema(const Table &table, std::string &output) {
   }
   output = "rows:" + std::to_string(length) + "\n" + output;
 }
-
-// void select(const Table &table, Schema &schema, char **args_ptr, int argc) {
-//   int limit = std::stoi(std::string(args_ptr[argc - 1]));
-//
-//   std::string cols{args_ptr[3]};
-//   std::vector<int> cols_index;
-//   auto start = 0;
-//   auto end = cols.find(',', start);
-//   while (end != std::string::npos) {
-//     auto col = cols.substr(start, end - start);
-//     auto index = schema[col];
-//     cols_index.push_back(index);
-//     start = end + 1;
-//     end = cols.find(',', start);
-//   }
-//   auto col = cols.substr(start, end - start);
-//   auto index = schema[col];
-//   cols_index.push_back(index);
-//   std::string output{};
-//   for (int i = 0; i < limit; i++) {
-//     output += '\n';
-//     for (auto id : cols_index) {
-//       auto &c = table[id];
-//       if (auto *v = std::get_if<std::vector<int64_t>>(&c.data)) {
-//         output += std::to_string((*v)[i]) + ",";
-//       } else if (auto *v = std::get_if<std::vector<double>>(&c.data)) {
-//         output += std::to_string((*v)[i]) + ",";
-//       } else if (auto *v = std::get_if<std::vector<std::string>>(&c.data)) {
-//         output += (*v)[i] + ",";
-//       } else {
-//         std::cerr << "Error: column datatype not detected\n";
-//       }
-//     }
-//     if (output.back() == ',')
-//       output.pop_back();
-//   }
-//   std::cout << output;
-// }
-//
-// void filter(const Table &table, Schema &schema, char **args_ptr, int argc) {
-//   std::string colname = std::string(args_ptr[3]);
-//   auto index = schema[colname];
-//   auto &c = table[index];
-//   std::function<bool(double, double)> op;
-//   auto op_string = std::string(args_ptr[4]);
-//   if (op_string == "==") {
-//     op = std::equal_to<>{};
-//   } else if (op_string == "!=") {
-//     op = std::not_equal_to<>{};
-//   } else if (op_string == "<") {
-//     op = std::less<>{};
-//   } else if (op_string == "<=") {
-//     op = std::less_equal<>{};
-//   } else if (op_string == ">") {
-//     op = std::greater<>{};
-//   } else if (op_string == ">=") {
-//     op = std::greater_equal<>{};
-//   } else {
-//     std::cerr << "Error: Invalid operation\n";
-//     return;
-//   }
-//
-//   auto limit = std::stod(std::string(args_ptr[5]));
-//   auto count{0};
-//   auto pred = [&limit, &count, &op](double d) { return count += op(d, limit);
-//   };
-//
-//   std::visit(
-//       [&](auto &v) {
-//         using T = typename std::decay_t<decltype(v)>::value_type;
-//         if constexpr (std::is_same_v<T, std::string>) {
-//           std::cerr << "Error: string column datatype not supported\n";
-//         } else {
-//           std::for_each(v.begin(), v.end(), pred);
-//         }
-//       },
-//       c.data);
-//   std::cout << "count:" << count << "\n";
-// }
-//
-// void agg(const Table &table, Schema &schema, char **args_ptr, int argc) {
-//   std::string colname{args_ptr[4]};
-//   std::string func{args_ptr[3]};
-//   const auto &c = table[schema[colname]];
-//
-//   if (func == "count") {
-//     std::visit([](const auto &v) { std::cout << v.size() << "\n"; }, c.data);
-//     return;
-//   }
-//   std::visit(
-//       [&](const auto &v) {
-//         using T = typename std::decay_t<decltype(v)>::value_type;
-//
-//         if constexpr (!std::is_arithmetic_v<T>) {
-//           std::cerr << "Error: invalid func for string datatype\n";
-//         } else {
-//           if (v.empty()) {
-//             std::cerr << "Error: column is empty\n";
-//             return;
-//           }
-//           double ans;
-//           if (func == "sum") {
-//             ans = std::accumulate(v.begin(), v.end(), 0.0);
-//           } else if (func == "avg") {
-//             ans = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
-//           } else if (func == "max") {
-//             ans = *std::max_element(v.begin(), v.end());
-//           } else if (func == "min") {
-//             ans = *std::min_element(v.begin(), v.end());
-//           } else {
-//             std::cerr << "Error: invalid func\n";
-//             return;
-//           }
-//           // Force fixed-point notation AND adjust decimal precision
-//           std::cout << std::fixed << std::setprecision(10) << ans << "\n";
-//         }
-//       },
-//       c.data);
-// }
-//
-// void groupby(const Table &table, Schema &schema, char **args_ptr, int argc) {
-//   auto groupcol = std::string(args_ptr[3]);
-//   auto &gc = table[schema[groupcol]];
-//   auto aggcol = std::string(args_ptr[5]);
-//   auto &ac = table[schema[aggcol]];
-//   auto func = std::string(args_ptr[4]);
-//
-//   std::visit(
-//       [&](const auto &keys, const auto &vals) {
-//         using K = typename std::decay_t<decltype(keys)>::value_type;
-//         using V = typename std::decay_t<decltype(vals)>::value_type;
-//
-//         std::unordered_map<K, std::vector<size_t>> group_cols;
-//         for (auto i = 0; i < keys.size(); i++) {
-//           group_cols[keys[i]].push_back(i);
-//         }
-//
-//         for (auto &[key, idx] : group_cols) {
-//           if (func == "count") {
-//             std::cout << key << idx.size() << "\n";
-//           } else if constexpr (!std::is_arithmetic_v<V>) {
-//             std::cerr << "Error: Invalid func for string agg col\n";
-//             return;
-//           } else {
-//             std::vector<V> subset;
-//             subset.reserve(idx.size());
-//             for (auto id : idx) {
-//               if (id < vals.size()) {
-//                 subset.push_back(vals[id]);
-//               }
-//             }
-//
-//             double ans{};
-//             if (func == "sum") {
-//               ans = std::accumulate(subset.begin(), subset.end(), 0.0);
-//             } else if (func == "avg") {
-//               ans = std::accumulate(subset.begin(), subset.end(), 0.0) /
-//                     idx.size();
-//             } else if (func == "max") {
-//               ans = *std::max_element(subset.begin(), subset.end());
-//             } else if (func == "min") {
-//               ans = *std::min_element(subset.begin(), subset.end());
-//             } else {
-//               std::cerr << "Error: invalid func\n";
-//               return;
-//             }
-//
-//             std::cout << key << std::fixed << std::setprecision(10) << ans
-//                       << "\n";
-//           }
-//         }
-//       },
-//       gc.data, ac.data);
-// }
