@@ -21,6 +21,7 @@
 #include <string_view>
 #include <sys/select.h>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -246,19 +247,22 @@ int main(int argc, char *argv[]) {
       batches.push_back(std::move(in));
     }
     for (auto &b : batches) {
-      for (auto i = 0; i < b.size; i++) {
+      for (auto i = 0; i < b.row_mask.size(); i++) {
+        if (!b.row_mask[i]) {
+          continue;
+        }
         output += "\n";
-        for (auto &cd : b.columns) {
+        for (auto &cp : b.columns) {
           std::visit(
               [&](auto &c) {
-                using T = typename std::decay_t<decltype(c)>::value_type;
+                using T = typename std::decay_t<decltype(*c)>;
                 if constexpr (std::is_same_v<T, std::string>) {
-                  output += c[i] + ",";
+                  output += *(c + i) + ",";
                 } else {
-                  output += std::to_string(c[i]) + ",";
+                  output += std::to_string(*(c + i)) + ",";
                 }
               },
-              cd);
+              cp);
         }
       }
       output.pop_back();
@@ -307,7 +311,7 @@ int main(int argc, char *argv[]) {
     auto count{0};
     Batch in;
     while (filter->next(in)) {
-      count += in.size;
+      count += std::accumulate(in.row_mask.begin(), in.row_mask.end(), 0);
     }
 
     output = "count:" + std::to_string(count) + "\n";
@@ -339,9 +343,20 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    auto d = std::get_if<std::vector<double>>(&batches[0].columns[0]);
+    double d;
+    if (func == "sum") {
+      d = agg->ag.sum;
+    } else if (func == "count") {
+      d = agg->ag.count;
+    } else if (func == "avg") {
+      d = agg->ag.sum / agg->ag.count;
+    } else if (func == "max") {
+      d = agg->ag.max;
+    } else if (func == "min") {
+      d = agg->ag.min;
+    }
     std::ostringstream oss;
-    oss << std::fixed << std::setprecision(10) << d->at(0);
+    oss << std::fixed << std::setprecision(10) << d;
     output = oss.str();
     agg->close();
   }
@@ -370,38 +385,37 @@ int main(int argc, char *argv[]) {
     if (batches.size() > 1) {
       std::cerr << "Error: multiple groupby outputs\n";
       return 1;
-    } else if (batches[0].columns.size() > 2) {
-      std::cerr << "Error: too many columns in groupby output\n";
-      return 1;
     }
 
-    auto out = batches[0];
+    std::function<double(AggState *)> getValue;
+    if (func == "count") {
+      getValue = [](AggState *agg) { return agg->count; };
+    } else if (func == "sum") {
+      getValue = [](AggState *agg) { return agg->sum; };
+    } else if (func == "avg") {
+      getValue = [](AggState *agg) { return agg->sum / agg->count; };
+    } else if (func == "min") {
+      getValue = [](AggState *agg) { return agg->min; };
+    } else if (func == "max") {
+      getValue = [](AggState *agg) { return agg->max; };
+    } else {
+      std::cerr << "Error: Invalid func\n";
+    }
 
-    std::visit(
-        [&](auto &groups, auto &ans) {
-          using G = typename std::decay_t<decltype(groups)>::value_type;
-          using A = typename std::decay_t<decltype(ans)>::value_type;
-
-          if constexpr (!std::is_same_v<A, double>) {
-            std::cerr
-                << "Error: recieved non-double column for groupby ans column\n";
-            // return 1;
-          } else {
-            for (auto i = 0; i < out.size; i++) {
-              if constexpr (std::is_same_v<G, std::string>) {
-                output += groups[i];
-              } else {
-                output += std::to_string(groups[i]);
-              }
-
+    if (groupby->running_state.size() != 0) {
+      std::visit(
+          [&](auto &gc) {
+            using K = typename std::decay_t<decltype(gc)>::value_type;
+            for (auto &[g, as] : groupby->running_state) {
+              output += g;
               std::ostringstream oss;
-              oss << std::fixed << std::setprecision(10) << ans[i];
+              oss << std::fixed << std::setprecision(10) << getValue(&as);
               output += " " + oss.str();
               output += "\n";
             }
-          }
-        },
-        out.columns[0], out.columns[1]);
+          },
+          table[group_id].data);
+    }
     groupby->close();
   }
 
@@ -415,7 +429,7 @@ int main(int argc, char *argv[]) {
     }
     std::unique_ptr<Operator> root;
     root = std::make_unique<ScanOp>(table);
-    std::string terminal{};
+    bool terminal{false};
     int i{3};
     while (i < argc) {
       if (std::string_view(argv[i]) == "filter") {
@@ -459,12 +473,48 @@ int main(int argc, char *argv[]) {
         }
 
         std::string colname{argv[i + 2]};
-        std::string func{argv[i + 1]};
+        std::string func = argv[i + 1];
 
-        root = std::make_unique<AggOp>(std::move(root), func,
-                                       table_schema[colname]);
-        terminal = "agg";
+        auto agg = std::make_unique<AggOp>(std::move(root), func,
+                                           table_schema[colname]);
+        std::vector<Batch> batches;
+        Batch in;
+        agg->open();
+        while (agg->next(in)) {
+          batches.push_back(std::move(in));
+        }
+        if (batches.size() > 1) {
+          std::cerr << "Error: multiple agg outputs\n";
+          return 1;
+        }
+
+        if (!agg->ag.first) {
+          double d;
+          if (func == "sum") {
+            d = agg->ag.sum;
+          } else if (func == "count") {
+            d = agg->ag.count;
+          } else if (func == "avg") {
+            d = agg->ag.sum / agg->ag.count;
+          } else if (func == "max") {
+            d = agg->ag.max;
+          } else if (func == "min") {
+            d = agg->ag.min;
+          }
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(10) << d;
+          output = oss.str();
+        } else if (func == "count") {
+          double d;
+          d = agg->ag.count;
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(10) << d;
+          output = oss.str();
+        }
+
+        agg->close();
         i += 3;
+        terminal = true;
         break;
       } else if (std::string_view(argv[i]) == "select") {
         if (i + 2 >= argc) {
@@ -493,9 +543,37 @@ int main(int argc, char *argv[]) {
         root = std::make_unique<ProjectionOp>(
             std::move(root), cols_index.begin(), cols_index.end());
         int limit = std::stoi(std::string(argv[i + 2]));
-        root = std::make_unique<LimitOp>(std::move(root), limit);
+        auto limiter = std::make_unique<LimitOp>(std::move(root), limit);
+        limiter->open();
+        std::vector<Batch> batches;
+        Batch in;
+        while (limiter->next(in)) {
+          batches.push_back(std::move(in));
+        }
+        for (auto &b : batches) {
+          for (auto i = 0; i < b.row_mask.size(); i++) {
+            if (!b.row_mask[i]) {
+              continue;
+            }
+            output += "\n";
+            for (auto &cp : b.columns) {
+              std::visit(
+                  [&](auto &c) {
+                    using T = typename std::decay_t<decltype(*c)>;
+                    if constexpr (std::is_same_v<T, std::string>) {
+                      output += *(c + i) + ",";
+                    } else {
+                      output += std::to_string(*(c + i)) + ",";
+                    }
+                  },
+                  cp);
+            }
+            output.pop_back();
+          }
+        }
 
-        terminal = "select";
+        limiter->close();
+        terminal = true;
         i += 3;
         break;
       } else if (std::string_view(argv[i]) == "groupby") {
@@ -509,11 +587,52 @@ int main(int argc, char *argv[]) {
         auto aggcol = std::string(argv[i + 3]);
         auto agg_id = table_schema[aggcol];
         auto func = std::string(argv[i + 2]);
-        root = std::make_unique<GroupByOp>(std::move(root), group_id, agg_id,
-                                           func);
+        auto groupby = std::make_unique<GroupByOp>(std::move(root), group_id,
+                                                   agg_id, func);
+        groupby->open();
+        std::vector<Batch> batches;
+        Batch in;
+        while (groupby->next(in)) {
+          batches.push_back(std::move(in));
+        }
 
-        terminal = "groupby";
+        if (batches.size() > 1) {
+          std::cerr << "Error: multiple groupby outputs\n";
+          return 1;
+        }
+
+        std::function<double(AggState *)> getValue;
+        if (func == "count") {
+          getValue = [](AggState *agg) { return agg->count; };
+        } else if (func == "sum") {
+          getValue = [](AggState *agg) { return agg->sum; };
+        } else if (func == "avg") {
+          getValue = [](AggState *agg) { return agg->sum / agg->count; };
+        } else if (func == "min") {
+          getValue = [](AggState *agg) { return agg->min; };
+        } else if (func == "max") {
+          getValue = [](AggState *agg) { return agg->max; };
+        } else {
+          std::cerr << "Error: Invalid func\n";
+        }
+
+        if (groupby->running_state.size() != 0) {
+          std::visit(
+              [&](auto &gc) {
+                using K = typename std::decay_t<decltype(gc)>::value_type;
+                for (auto &[g, as] : groupby->running_state) {
+                  output += g;
+                  std::ostringstream oss;
+                  oss << std::fixed << std::setprecision(10) << getValue(&as);
+                  output += " " + oss.str();
+                  output += "\n";
+                }
+              },
+              table[group_id].data);
+        }
+        groupby->close();
         i += 4;
+        terminal = true;
         break;
       } else {
         std::cerr << "Error: Invalid pipeline command/stage\n";
@@ -526,112 +645,24 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    root->open();
-    if (terminal == "agg") {
-      std::vector<Batch> batches;
-      Batch in;
-      while (root->next(in)) {
-        batches.push_back(std::move(in));
-      }
-      if (batches.size() > 1) {
-        std::cerr << "Error: multiple agg outputs\n";
-        return 1;
-      }
-      auto d = std::get_if<std::vector<double>>(&batches[0].columns[0]);
-
-      if (d) {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(10) << d->at(0);
-        output = oss.str();
-      }
-    } else if (terminal == "select") {
-      std::vector<Batch> batches;
-      Batch in;
-      while (root->next(in)) {
-        batches.push_back(std::move(in));
-      }
-      for (auto &b : batches) {
-        for (auto i = 0; i < b.size; i++) {
-          output += "\n";
-          for (auto &cd : b.columns) {
-            std::visit(
-                [&](auto &c) {
-                  using T = typename std::decay_t<decltype(c)>::value_type;
-                  if constexpr (std::is_same_v<T, std::string>) {
-                    output += c[i] + ",";
-                  } else {
-                    output += std::to_string(c[i]) + ",";
-                  }
-                },
-                cd);
-          }
-          output.pop_back();
-        }
-      }
-    } else if (terminal == "groupby") {
-      std::vector<Batch> batches;
-      Batch in;
-      while (root->next(in)) {
-        batches.push_back(std::move(in));
-      }
-
-      if (batches.size() > 1) {
-        std::cerr << "Error: multiple groupby outputs\n";
-        return 1;
-      } else if (batches[0].columns.size() > 2) {
-        std::cerr << "Error: too many columns in groupby output\n";
-        return 1;
-      } else if (batches[0].size == 0) {
-        output += "{no groups}";
-      } else {
-
-        // std::cout << batches[0].size << "\n";
-
-        auto out = batches[0];
-
-        std::visit(
-            [&](auto &groups, auto &ans) {
-              using G = typename std::decay_t<decltype(groups)>::value_type;
-              using A = typename std::decay_t<decltype(ans)>::value_type;
-
-              if constexpr (!std::is_same_v<A, double>) {
-                std::cerr
-                    << "Error: recieved non-double column for groupby ans "
-                       "column\n";
-                // return 1;
-              } else {
-                for (auto i = 0; i < out.size; i++) {
-                  if constexpr (std::is_same_v<G, std::string>) {
-                    output += groups[i];
-                  } else {
-                    output += std::to_string(groups[i]);
-                  }
-
-                  std::ostringstream oss;
-                  oss << std::fixed << std::setprecision(10) << ans[i];
-                  output += " " + oss.str();
-                  output += "\n";
-                }
-              }
-            },
-            out.columns[0], out.columns[1]);
-      }
-    } else {
+    if (!terminal) {
+      root->open();
       auto count{0};
       Batch in;
       while (root->next(in)) {
-        count += in.size;
+        count += std::accumulate(in.row_mask.begin(), in.row_mask.end(), 0);
       }
 
       output = "count:" + std::to_string(count) + "\n";
+      root->close();
     }
-    root->close();
   }
 
   else {
     std::cerr << "Error: invalid command\n";
     return 1;
   }
+
   auto finish = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> duration = finish - begin;
   std::cerr << "QUERY_MS: " << duration.count() << "\n";

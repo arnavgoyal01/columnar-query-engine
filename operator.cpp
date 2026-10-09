@@ -1,15 +1,26 @@
 #include "operator.h"
+#include "types.h"
 #include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <grp.h>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+void AggState::add_row() { count += 1; }
+
+void AggState::update(double value) {
+  sum += value;
+  min = first ? value : std::min(value, min);
+  max = first ? value : std::max(value, max);
+  first = false;
+}
 
 bool ScanOp::next(Batch &batch) {
   if (pos >= t[0].length) {
@@ -23,12 +34,12 @@ bool ScanOp::next(Batch &batch) {
     std::visit(
         [&](const auto &full) {
           using V = typename std::decay_t<decltype(full)>::value_type;
-          std::vector<V> slice(full.begin() + pos, full.begin() + pos + n);
-          batch.columns.push_back(std::move(slice));
+          const V *slice = &full[pos];
+          batch.columns.push_back(slice);
         },
         c.data);
   }
-  batch.size = n;
+  batch.row_mask = std::vector<uint8_t>(n, 1);
   pos += n;
   return true;
 }
@@ -39,46 +50,25 @@ void ScanOp::close() {}
 
 bool FilterOp::next(Batch &out) {
   Batch in;
-  out.columns.clear();
-  out.size = 0;
   while (child->next(in)) {
+    out.row_mask.clear();
     auto &cd = in.columns[index];
-    std::vector<size_t> selected;
     std::visit(
         [&](const auto &c) {
-          using T = typename std::decay_t<decltype(c)>::value_type;
+          using T = typename std::decay_t<decltype(*c)>;
           if constexpr (std::is_same_v<T, std::string>) {
             std::cerr << "Error: string column\n";
             return;
           } else {
-            selected.reserve(c.size());
-            for (size_t i = 0; i < in.size; i++) {
-              if (pred(c[i])) {
-                selected.push_back(i);
-              }
+            out.row_mask.reserve(in.row_mask.size());
+            for (int i = 0; i < in.row_mask.size(); i++) {
+              out.row_mask.push_back(pred(*(c + i)) * in.row_mask[i]);
             }
           }
         },
         cd);
 
-    if (!selected.size())
-      continue;
-
-    for (auto &cd : in.columns) {
-      std::visit(
-          [&](const auto &c) {
-            using C = typename std::decay_t<decltype(c)>::value_type;
-            std::vector<C> slice;
-            slice.reserve(selected.size());
-            for (auto i : selected) {
-              slice.push_back(c[i]);
-            }
-            out.columns.push_back(std::move(slice));
-          },
-          cd);
-    }
-
-    out.size = selected.size();
+    out.columns = in.columns;
     return true;
   }
   return false;
@@ -92,68 +82,26 @@ bool AggOp::next(Batch &out) {
   if (already_emitted)
     return false;
   Batch in;
-  std::vector<double> ans;
-  double count{};
-  out.columns.clear();
-  out.size = 0;
   while (child->next(in)) {
     auto &cd = in.columns[index];
     std::visit(
         [&](const auto &v) {
-          using T = typename std::decay_t<decltype(v)>::value_type;
-          if constexpr (std::is_same_v<T, std::string>) {
+          using T = typename std::decay_t<decltype(*v)>;
+          if constexpr (!std::is_arithmetic_v<T>) {
             std::cerr << "Error: string column not applicable for agg\n";
             return;
           } else {
-            if (v.empty()) {
-              std::cerr << "Error: column is empty\n";
-              return;
+            for (int i = 0; i < in.row_mask.size(); i++) {
+              if (in.row_mask[i]) {
+                ag.add_row();
+                ag.update(*(v + i));
+              }
             }
-            double a{};
-            count += v.size();
-            if (func == "sum" || func == "avg" || func == "count") {
-              a = std::accumulate(v.begin(), v.end(), 0.0);
-            } else if (func == "max") {
-              a = *std::max_element(v.begin(), v.end());
-            } else if (func == "min") {
-              a = *std::min_element(v.begin(), v.end());
-            } else {
-              std::cerr << "Error: invalid func\n";
-              return;
-            }
-            ans.push_back(a);
           }
         },
         cd);
   }
 
-  if (ans.size() == 0) {
-    if (func == "count") {
-      std::vector<double> vec{0};
-      out.columns.push_back(std::move(vec));
-      out.size = 1;
-    }
-    already_emitted = true;
-    return true;
-  }
-
-  double result{};
-  if (func == "sum") {
-    result = std::accumulate(ans.begin(), ans.end(), 0.0);
-  } else if (func == "count") {
-    result = count;
-  } else if (func == "avg") {
-    result = std::accumulate(ans.begin(), ans.end(), 0.0);
-    result /= count;
-  } else if (func == "max") {
-    result = *std::max_element(ans.begin(), ans.end());
-  } else if (func == "min") {
-    result = *std::min_element(ans.begin(), ans.end());
-  }
-  // Force fixed-point notation AND adjust decimal precision
-  std::vector<double> vec{result};
-  out.columns.push_back(std::move(vec));
-  out.size = 1;
   already_emitted = true;
   return true;
 }
@@ -166,23 +114,17 @@ void AggOp::open() {
 void AggOp::close() { child->close(); }
 
 bool ProjectionOp::next(Batch &out) {
-  out.columns.clear();
-  out.size = 0;
-  std::vector<size_t> sizes;
   Batch in;
+  out.columns.clear();
+  out.columns.reserve(col_indices.size());
   while (child->next(in)) {
     for (auto &i : col_indices) {
-      std::visit(
-          [&](auto &c) {
-            out.columns.push_back(c);
-            sizes.push_back(c.size());
-          },
-          in.columns[i]);
+      out.columns.push_back(in.columns[i]);
     }
     if (!out.columns.size())
       continue;
 
-    out.size = *std::max_element(sizes.begin(), sizes.end());
+    out.row_mask = in.row_mask;
     return true;
   }
 
@@ -196,23 +138,27 @@ void ProjectionOp::close() { child->close(); }
 bool LimitOp::next(Batch &out) {
   Batch in;
   out.columns.clear();
-  out.size = 0;
   while (child->next(in)) {
     if (limit <= 0) {
       return false;
     }
-    auto size = std::min<double>(limit, in.size);
-    for (auto &cd : in.columns) {
-      std::visit(
-          [&](auto &c) {
-            using T = typename std::decay_t<decltype(c)>::value_type;
-            std::vector<T> slice(c.begin(), c.begin() + size);
-            out.columns.push_back(slice);
-          },
-          cd);
+
+    int d = std::accumulate(in.row_mask.begin(), in.row_mask.end(), 0);
+    if (d <= limit) {
+      limit -= d;
+      out = in;
+    } else {
+      double sum{0};
+      int i{0};
+      while (sum < limit) {
+        sum += in.row_mask[i];
+        i++;
+      }
+      out.columns = in.columns;
+      std::vector<uint8_t> vec(in.row_mask.begin(), in.row_mask.begin() + i);
+      out.row_mask = vec;
+      limit -= sum;
     }
-    out.size = size;
-    limit -= size;
     return true;
   }
   return false;
@@ -230,88 +176,58 @@ void GroupByOp::open() {
 
 void GroupByOp::close() { child->close(); }
 
-void GroupByOp::AggState::add_row() { count += 1; }
-
-void GroupByOp::AggState::update(double value) {
-  sum += value;
-  min = first ? value : std::min(value, min);
-  max = first ? value : std::max(value, max);
-  first = false;
-}
-
 bool GroupByOp::next(Batch &out) {
   if (already_emitted)
     return false;
   Batch in;
   out.columns.clear();
-  out.size = 0;
-
   while (child->next(in)) {
     auto &gc = in.columns[group_id];
     auto &ac = in.columns[agg_id];
+
+    if (out.columns.empty()) {
+      out = in;
+    }
+
     std::visit(
         [&](const auto &keys, const auto &vals) {
-          using K = typename std::decay_t<decltype(keys)>::value_type;
-          using V = typename std::decay_t<decltype(vals)>::value_type;
-          if (out.columns.size() == 0) {
-            out.columns.push_back(std::vector<K>());
-          }
+          using K = typename std::decay_t<decltype(*keys)>;
+          using V = typename std::decay_t<decltype(*vals)>;
 
           if constexpr (!std::is_arithmetic_v<V>) {
             if (func != "count") {
               std::cerr << "Error: Invalid func for string agg col\n";
               return;
             } else {
-              for (auto i = 0; i < keys.size(); i++) {
-                running_state[keys[i]].add_row();
+              for (auto i = 0; i < in.row_mask.size(); i++) {
+                if (in.row_mask[i]) {
+                  if constexpr (std::is_same_v<K, std::string>) {
+                    running_state[*(keys + i)].add_row();
+                  } else {
+                    running_state[std::to_string(*(keys + i))].add_row();
+                  }
+                }
               }
             }
           } else {
-            for (auto i = 0; i < keys.size(); i++) {
-              running_state[keys[i]].add_row();
-              running_state[keys[i]].update(vals[i]);
+            for (auto i = 0; i < in.row_mask.size(); i++) {
+              if (in.row_mask[i]) {
+                std::string ky;
+                if constexpr (std::is_same_v<K, std::string>) {
+                  ky = *(keys + i);
+                } else {
+                  ky = std::to_string(*(keys + i));
+                }
+                auto &ag = running_state[ky];
+                ag.add_row();
+                ag.update(*(vals + i));
+              }
             }
           }
         },
         gc, ac);
   }
 
-  if (running_state.size() == 0) {
-    out.columns.clear();
-    out.size = 0;
-    already_emitted = true;
-    return true;
-  }
-
-  std::vector<double> answers;
-  answers.reserve(running_state.size());
-  std::function<double(AggState *)> getValue;
-  if (func == "count") {
-    getValue = [](AggState *agg) { return agg->count; };
-  } else if (func == "sum") {
-    getValue = [](AggState *agg) { return agg->sum; };
-  } else if (func == "avg") {
-    getValue = [](AggState *agg) { return agg->sum / agg->count; };
-  } else if (func == "min") {
-    getValue = [](AggState *agg) { return agg->min; };
-  } else if (func == "max") {
-    getValue = [](AggState *agg) { return agg->max; };
-  } else {
-    std::cerr << "Error: Invalid func\n";
-  }
-
-  std::visit(
-      [&](auto &groups) {
-        using K = typename std::decay_t<decltype(groups)>::value_type;
-        out.size = running_state.size();
-        for (auto &[g, as] : running_state) {
-          groups.push_back(std::get<K>(g));
-          answers.push_back(getValue(&as));
-        }
-      },
-      out.columns[0]);
-
-  out.columns.push_back(answers);
   already_emitted = true;
   return true;
 }

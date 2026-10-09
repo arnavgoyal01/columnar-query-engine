@@ -33,7 +33,7 @@ struct ScanOp : Operator {
 
 struct FilterOp : Operator {
   std::unique_ptr<Operator> child;
-  std::function<bool(double)> pred;
+  std::function<bool(const double)> pred;
   size_t index;
 
   FilterOp(std::unique_ptr<Operator> child, size_t index,
@@ -50,6 +50,7 @@ struct AggOp : Operator {
   std::unique_ptr<Operator> child;
   std::string func;
   size_t index;
+  AggState ag;
   bool already_emitted;
 
   AggOp(std::unique_ptr<Operator> child, std::string func, size_t index)
@@ -96,16 +97,7 @@ struct GroupByOp : Operator {
   size_t agg_id;
   std::string func;
   bool already_emitted{false};
-  using ScalarVariant = std::variant<double, int64_t, std::string>;
-
-  struct AggState {
-    double sum, count, max, min;
-    bool first{true};
-    void add_row();
-    void update(double value);
-  };
-
-  std::unordered_map<ScalarVariant, AggState> running_state;
+  std::unordered_map<std::string, AggState> running_state;
 
   GroupByOp(std::unique_ptr<Operator> child, size_t gid, size_t aid,
             std::string func)
