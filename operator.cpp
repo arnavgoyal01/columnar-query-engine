@@ -9,6 +9,7 @@
 #include <numeric>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -20,6 +21,12 @@ void AggState::update(double value) {
   min = first ? value : std::min(value, min);
   max = first ? value : std::max(value, max);
   first = false;
+}
+
+void AggState::reset() {
+  sum = 0;
+  count = 0;
+  first = true;
 }
 
 bool ScanOp::next(Batch &batch) {
@@ -107,6 +114,7 @@ bool AggOp::next(Batch &out) {
 }
 
 void AggOp::open() {
+  ag.reset();
   child->open();
   already_emitted = false;
 }
@@ -169,13 +177,13 @@ void LimitOp::open() { child->open(); }
 void LimitOp::close() { child->close(); }
 
 void GroupByOp::open() {
-  running_state.clear();
+  std::visit([](auto &map) { map.clear(); }, running_state);
   already_emitted = false;
   child->open();
 }
 
 void GroupByOp::close() { child->close(); }
-
+template <typename T> struct DumpType;
 bool GroupByOp::next(Batch &out) {
   if (already_emitted)
     return false;
@@ -194,36 +202,43 @@ bool GroupByOp::next(Batch &out) {
           using K = typename std::decay_t<decltype(*keys)>;
           using V = typename std::decay_t<decltype(*vals)>;
 
-          if constexpr (!std::is_arithmetic_v<V>) {
-            if (func != "count") {
-              std::cerr << "Error: Invalid func for string agg col\n";
-              return;
-            } else {
-              for (auto i = 0; i < in.row_mask.size(); i++) {
-                if (in.row_mask[i]) {
-                  if constexpr (std::is_same_v<K, std::string>) {
-                    running_state[*(keys + i)].add_row();
-                  } else {
-                    running_state[std::to_string(*(keys + i))].add_row();
-                  }
-                }
-              }
-            }
-          } else {
-            for (auto i = 0; i < in.row_mask.size(); i++) {
-              if (in.row_mask[i]) {
-                std::string ky;
-                if constexpr (std::is_same_v<K, std::string>) {
-                  ky = *(keys + i);
-                } else {
-                  ky = std::to_string(*(keys + i));
-                }
-                auto &ag = running_state[ky];
-                ag.add_row();
-                ag.update(*(vals + i));
-              }
-            }
+          if (!std::holds_alternative<std::unordered_map<K, AggState>>(
+                  running_state)) {
+            running_state.emplace<std::unordered_map<K, AggState>>();
           }
+
+          std::visit(
+              [&](auto &map) {
+                using KeyType = typename std::decay_t<decltype(map)>::key_type;
+                if constexpr (std::is_same_v<K, KeyType>) {
+                  if constexpr (!std::is_arithmetic_v<V>) {
+                    if (func != "count") {
+                      std::cerr << "Error: Invalid func for string agg col\n";
+                      return;
+                    } else {
+                      for (auto i = 0; i < in.row_mask.size(); i++) {
+                        if (in.row_mask[i]) {
+                          map[*(keys + i)].add_row();
+                        }
+                      }
+                    }
+                  } else {
+                    for (auto i = 0; i < in.row_mask.size(); i++) {
+                      if (in.row_mask[i]) {
+                        auto ky = *(keys + i);
+                        auto &ag = map[ky];
+                        ag.add_row();
+                        ag.update(vals[i]);
+                      }
+                    }
+                  }
+                } else {
+                  std::cerr << "Error: KeyType and ColumnType do not match\n";
+                  return;
+                }
+                // DumpType<K> dump;
+              },
+              running_state);
         },
         gc, ac);
   }

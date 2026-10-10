@@ -402,20 +402,25 @@ int main(int argc, char *argv[]) {
       std::cerr << "Error: Invalid func\n";
     }
 
-    if (groupby->running_state.size() != 0) {
-      std::visit(
-          [&](auto &gc) {
-            using K = typename std::decay_t<decltype(gc)>::value_type;
-            for (auto &[g, as] : groupby->running_state) {
-              output += g;
+    std::visit(
+        [&](auto &map) {
+          if (map.size() != 0) {
+            using KeyType = typename std::decay_t<decltype(map)>::key_type;
+            for (auto &[g, as] : map) {
+              if constexpr (std::is_same_v<KeyType, std::string>) {
+                output += g;
+              } else {
+                output += std::to_string(g);
+              }
               std::ostringstream oss;
               oss << std::fixed << std::setprecision(10) << getValue(&as);
               output += " " + oss.str();
               output += "\n";
             }
-          },
-          table[group_id].data);
-    }
+          }
+        },
+        groupby->running_state);
+
     groupby->close();
   }
 
@@ -616,20 +621,24 @@ int main(int argc, char *argv[]) {
           std::cerr << "Error: Invalid func\n";
         }
 
-        if (groupby->running_state.size() != 0) {
-          std::visit(
-              [&](auto &gc) {
-                using K = typename std::decay_t<decltype(gc)>::value_type;
-                for (auto &[g, as] : groupby->running_state) {
-                  output += g;
+        std::visit(
+            [&](auto &map) {
+              if (map.size() != 0) {
+                using KeyType = typename std::decay_t<decltype(map)>::key_type;
+                for (auto &[g, as] : map) {
+                  if constexpr (std::is_same_v<KeyType, std::string>) {
+                    output += g;
+                  } else {
+                    output += std::to_string(g);
+                  }
                   std::ostringstream oss;
                   oss << std::fixed << std::setprecision(10) << getValue(&as);
                   output += " " + oss.str();
                   output += "\n";
                 }
-              },
-              table[group_id].data);
-        }
+              }
+            },
+            groupby->running_state);
         groupby->close();
         i += 4;
         terminal = true;

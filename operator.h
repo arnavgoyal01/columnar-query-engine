@@ -97,7 +97,8 @@ struct GroupByOp : Operator {
   size_t agg_id;
   std::string func;
   bool already_emitted{false};
-  std::unordered_map<std::string, AggState> running_state;
+
+  GroupsIndex running_state;
 
   GroupByOp(std::unique_ptr<Operator> child, size_t gid, size_t aid,
             std::string func)

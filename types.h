@@ -9,6 +9,7 @@ using ColumnData = std::variant<std::vector<int64_t>, std::vector<double>,
                                 std::vector<std::string>>;
 using ColumnPointer =
     std::variant<const int64_t *, const double *, const std::string *>;
+
 using ColumnType = std::string;
 struct Column {
   std::string name;
@@ -27,7 +28,12 @@ struct AggState {
   bool first{true};
   void add_row();
   void update(double value);
+  void reset();
 };
+
+using GroupsIndex = std::variant<std::unordered_map<int64_t, AggState>,
+                                 std::unordered_map<double, AggState>,
+                                 std::unordered_map<std::string, AggState>>;
 
 struct Batch {
   std::vector<ColumnPointer> columns;
