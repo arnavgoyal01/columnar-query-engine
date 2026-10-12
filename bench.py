@@ -99,7 +99,10 @@ else:
 # ---------- helpers ----------
 NUM = re.compile(r"-?\d+\.?\d*")
 def nums(s): return [float(x) for x in NUM.findall(s)]
-def approx(a, b, tol=1e-2): return abs(a - b) <= tol + tol * abs(b)
+# Tolerance: reordering a float sum (e.g. for SIMD) changes it by ~1e-12 relative.
+# 1e-6 leaves plenty of room for that while still catching real bugs
+# (the previous 1% let a truncate-to-int bug through at 0.99% error).
+def approx(a, b, tol=1e-6): return abs(a - b) <= tol + tol * abs(b)
 
 def parse_groups(out):
     d = {}

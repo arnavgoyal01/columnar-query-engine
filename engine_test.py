@@ -205,6 +205,22 @@ for func, want in expected_aggs.items():
     else:
         bad(f"{func}(fare_amount): want {want:g}, got {out.strip()!r}")
 
+# fractional values: the main fixture's fares are all whole numbers, which
+# hides bugs that truncate doubles to integers
+FRAC_CSV = os.path.join(_tmpdir, "frac.csv")
+FRAC = [("a", 1.5), ("b", 2.25), ("a", 3.7), ("b", -0.4), ("a", 0.05)]
+with open(FRAC_CSV, "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["k", "v"]); w.writerows(FRAC)
+fv = [v for _, v in FRAC]
+for func, want in {"sum": sum(fv), "avg": sum(fv) / len(fv),
+                   "min": min(fv), "max": max(fv)}.items():
+    out, _ = run(["agg", FRAC_CSV, func, "v"])
+    got = nums(out)
+    if got and approx(got[-1], want, tol=1e-6):
+        ok(f"{func}(v) on fractional values = {want:g}")
+    else:
+        bad(f"{func}(v) on fractional values: want {want:g}, got {out.strip()!r}")
+
 # ============================================================
 #  STAGE 5 -- GROUP BY
 # ============================================================
@@ -246,6 +262,16 @@ if all(k in got and approx(got[k], v) for k, v in exp_cnt.items()) and len(got) 
        ", ".join(f"{k}={int(v)}" for k, v in exp_cnt.items()))
 else:
     bad(f"grouped count wrong; want {exp_cnt}, got {got}\nraw:\n{out.strip()}")
+
+# grouped sum over fractional values
+fexp = {}
+for k, v in FRAC: fexp[k] = fexp.get(k, 0.0) + v
+out, _ = run(["groupby", FRAC_CSV, "k", "sum", "v"])
+got = parse_groups(out)
+if len(got) == len(fexp) and all(k in got and approx(got[k], v, tol=1e-6) for k, v in fexp.items()):
+    ok("GROUP BY k, SUM(v) on fractional values  ->  " + ", ".join(f"{k}={v:g}" for k, v in fexp.items()))
+else:
+    bad(f"grouped sum on fractional values wrong; want {fexp}, got {got}\nraw:\n{out.strip()}")
 
 # ============================================================
 #  STAGE 6 -- validate against a reference engine (pandas)
@@ -349,8 +375,10 @@ def t_agg(filters, func, col):
     want = ref_agg(func, [r[CI[col]] for r in ref_rows(filters)])
     ns = nums(out)
     if want is None:
-        passed_ = good and not ns
-        wdesc = "no number (empty input)"
+        # inf / -inf / nan are values, not "no value": neutral elements must not leak out
+        leaked = re.search(r"\b(inf|infinity|nan)\b", out, re.I)
+        passed_ = good and not ns and not leaked
+        wdesc = "no number (empty input; inf/nan count as a number)"
     else:
         passed_ = good and bool(ns) and approx(ns[-1], want)
         wdesc = f"{want:g}"
@@ -414,13 +442,14 @@ for func in ["sum", "count", "min", "max"]:
     t_groupby(F1, "payment_type", func, "fare_amount")
 t_groupby(F2, "payment_type", "sum", "fare_amount")
 t_groupby(F1, "passenger_count", "sum", "fare_amount")            # integer group key
+t_groupby([("id", ">", 4)], "passenger_count", "count", "payment_type")  # count over a string column; filtered-out keys must not appear as groups
 
 print("  -- filter -> select")
 t_select(F1, ["id", "payment_type"], 3)
 t_select(F2, ["payment_type", "fare_amount"], 10)                 # limit > matches
 
 print("  -- nothing passes the filter")
-for func in ["count", "sum", "max"]:
+for func in ["count", "sum", "avg", "min", "max"]:
     t_agg(NONE, func, "fare_amount")
 t_groupby(NONE, "payment_type", "sum", "fare_amount")
 t_select(NONE, ["id"], 3)
@@ -454,6 +483,37 @@ if good and ns and approx(ns[-1], min(lo)):
     ok(f"10k rows: filter val > 99 -> agg min val (sparse matches across batches) -> {min(lo):g}")
 else:
     bad(f"10k rows: filter val > 99 -> agg min: want {min(lo):g}, got {out.strip()!r}")
+
+# a fully-filtered batch BETWEEN surviving batches: state that tracks
+# "seen any rows yet" must be per-run, not per-batch
+print("  -- a fully filtered-out batch between surviving batches")
+GAP = os.path.join(_tmpdir, "gap.csv")
+gap_rows = []
+for i in range(3072):
+    b = i // 1024
+    k = 0 if b == 1 else 1
+    v = 5.0 if i == 0 else (50.0 if b == 0 else (1.0 if b == 1 else 20.0 + i % 7))
+    gap_rows.append((k, v))
+with open(GAP, "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["k", "v"]); w.writerows(gap_rows)
+gv = [v for k, v in gap_rows if k > 0]
+for func, want in {"min": min(gv), "max": max(gv), "sum": sum(gv),
+                   "count": float(len(gv)), "avg": sum(gv) / len(gv)}.items():
+    out, good = run(["pipeline", GAP, "filter", "k", ">", "0", "agg", func, "v"])
+    ns = nums(out)
+    if good and ns and approx(ns[-1], want, tol=1e-6):
+        ok(f"3 batches, middle one fully filtered -> agg {func} = {want:g}")
+    else:
+        bad(f"3 batches, middle one fully filtered -> agg {func}: want {want:g}, got {out.strip()!r}")
+want_g = {}
+for k, v in gap_rows:
+    if k > 0: want_g["1"] = min(want_g.get("1", v), v)
+out, good = run(["pipeline", GAP, "filter", "k", ">", "0", "groupby", "k", "min", "v"])
+got = parse_groups(out)
+if good and len(got) == 1 and approx(got.get("1", float("nan")), want_g["1"], tol=1e-6):
+    ok(f"3 batches, middle one fully filtered -> groupby min = {want_g['1']:g}")
+else:
+    bad(f"3 batches, middle one fully filtered -> groupby min: want {want_g}, got {got}")
 
 # ============================================================
 #  SUMMARY

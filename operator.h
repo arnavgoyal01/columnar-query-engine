@@ -33,14 +33,12 @@ struct ScanOp : Operator {
 
 struct FilterOp : Operator {
   std::unique_ptr<Operator> child;
-  std::function<bool(const double)> pred;
+  Ops pred;
   size_t index;
+  double limit;
 
-  FilterOp(std::unique_ptr<Operator> child, size_t index,
-           std::function<bool(double, double)> op, double limit)
-      : child(std::move(child)), index(index) {
-    pred = [=](double d) { return op(d, limit); };
-  }
+  FilterOp(std::unique_ptr<Operator> child, size_t index, Ops op, double limit)
+      : child(std::move(child)), pred(op), index(index), limit(limit) {}
   bool next(Batch &out) override;
   void open() override;
   void close() override;
@@ -48,12 +46,12 @@ struct FilterOp : Operator {
 
 struct AggOp : Operator {
   std::unique_ptr<Operator> child;
-  std::string func;
+  Func func;
   size_t index;
   AggState ag;
   bool already_emitted;
 
-  AggOp(std::unique_ptr<Operator> child, std::string func, size_t index)
+  AggOp(std::unique_ptr<Operator> child, Func func, size_t index)
       : child(std::move(child)), func(func), index(index),
         already_emitted(false) {}
 
@@ -95,13 +93,12 @@ struct GroupByOp : Operator {
   std::unique_ptr<Operator> child;
   size_t group_id;
   size_t agg_id;
-  std::string func;
+  Func func;
   bool already_emitted{false};
 
   GroupsIndex running_state;
 
-  GroupByOp(std::unique_ptr<Operator> child, size_t gid, size_t aid,
-            std::string func)
+  GroupByOp(std::unique_ptr<Operator> child, size_t gid, size_t aid, Func func)
       : child(std::move(child)), group_id(gid), agg_id(aid), func(func) {}
 
   void open() override;

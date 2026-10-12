@@ -2,10 +2,12 @@
 #include "types.h"
 #include <algorithm>
 #include <cstddef>
+#include <execution>
 #include <functional>
 #include <grp.h>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <type_traits>
@@ -14,15 +16,10 @@
 #include <variant>
 #include <vector>
 
-void AggState::add_row() { count += 1; }
-
-void AggState::update(double value) {
-  sum += value;
-  min = first ? value : std::min(value, min);
-  max = first ? value : std::max(value, max);
-  first = false;
-}
-
+void AggState::add_row(int i) { count += i; }
+void AggState::updateSum(double value) { sum += value; }
+void AggState::updateMin(double value) { min = std::min(value, min); }
+void AggState::updateMax(double value) { max = std::max(value, max); }
 void AggState::reset() {
   sum = 0;
   count = 0;
@@ -61,16 +58,24 @@ bool FilterOp::next(Batch &out) {
     out.row_mask.clear();
     auto &cd = in.columns[index];
     std::visit(
-        [&](const auto &c) {
+        [&](const auto c) {
           using T = typename std::decay_t<decltype(*c)>;
           if constexpr (std::is_same_v<T, std::string>) {
             std::cerr << "Error: string column\n";
             return;
           } else {
-            out.row_mask.reserve(in.row_mask.size());
-            for (int i = 0; i < in.row_mask.size(); i++) {
-              out.row_mask.push_back(pred(*(c + i)) * in.row_mask[i]);
-            }
+            out.row_mask = in.row_mask;
+            std::visit(
+                [&](auto &op) {
+                  const auto d = c;
+                  const size_t bound = in.row_mask.size();
+                  auto opt = out.row_mask.data();
+                  auto ipt = in.row_mask.data();
+                  for (int i = 0; i < bound; i++) {
+                    *(opt + i) = op(*(d + i), limit) * *(ipt + i);
+                  }
+                },
+                pred);
           }
         },
         cd);
@@ -98,12 +103,49 @@ bool AggOp::next(Batch &out) {
             std::cerr << "Error: string column not applicable for agg\n";
             return;
           } else {
-            for (int i = 0; i < in.row_mask.size(); i++) {
-              if (in.row_mask[i]) {
-                ag.add_row();
-                ag.update(*(v + i));
+            const size_t bound = in.row_mask.size();
+            const auto ptr = in.row_mask.data();
+            std::vector<double> sums;
+            sums.reserve(bound);
+            const auto sptr = sums.data();
+            switch (func) {
+            case Func::SUM:
+              for (int i = 0; i < bound; i++) {
+                *(sptr + i) = *(v + i) * *(ptr + i);
               }
+              ag.updateSum(
+                  std::reduce(std::execution::unseq, sptr, sptr + bound, 0.0));
+              break;
+            case Func::COUNT:
+              for (int i = 0; i < bound; i++) {
+                ag.add_row(in.row_mask[i]);
+              }
+              break;
+            case Func::AVG:
+              for (int i = 0; i < bound; i++) {
+                ag.add_row(in.row_mask[i]);
+                *(sptr + i) = *(v + i) * *(ptr + i);
+              }
+              ag.updateSum(
+                  std::reduce(std::execution::unseq, sptr, sptr + bound, 0.0));
+              break;
+            case Func::MAX:
+              for (int i = 0; i < bound; i++) {
+                auto value =
+                    *(ptr + i) ? *(v + i) : -pos_inf_double::infinity();
+                ag.updateMax(value);
+              }
+              break;
+            case Func::MIN:
+              for (int i = 0; i < bound; i++) {
+                auto value = *(ptr + i) ? *(v + i) : pos_inf_double::infinity();
+                ag.updateMin(value);
+              }
+              break;
             }
+            auto b =
+                std::reduce(std::execution::unseq, ptr, ptr + bound, 0) != 0;
+            ag.first = b ? false : ag.first;
           }
         },
         cd);
@@ -183,7 +225,7 @@ void GroupByOp::open() {
 }
 
 void GroupByOp::close() { child->close(); }
-template <typename T> struct DumpType;
+// template <typename T> struct DumpType;
 bool GroupByOp::next(Batch &out) {
   if (already_emitted)
     return false;
@@ -212,24 +254,42 @@ bool GroupByOp::next(Batch &out) {
                 using KeyType = typename std::decay_t<decltype(map)>::key_type;
                 if constexpr (std::is_same_v<K, KeyType>) {
                   if constexpr (!std::is_arithmetic_v<V>) {
-                    if (func != "count") {
+                    if (func != Func::COUNT) {
                       std::cerr << "Error: Invalid func for string agg col\n";
                       return;
                     } else {
                       for (auto i = 0; i < in.row_mask.size(); i++) {
-                        if (in.row_mask[i]) {
-                          map[*(keys + i)].add_row();
-                        }
+                        if (!in.row_mask[i])
+                          continue;
+                        map[*(keys + i)].add_row(in.row_mask[i]);
                       }
                     }
                   } else {
                     for (auto i = 0; i < in.row_mask.size(); i++) {
-                      if (in.row_mask[i]) {
-                        auto ky = *(keys + i);
-                        auto &ag = map[ky];
-                        ag.add_row();
-                        ag.update(vals[i]);
+                      if (!in.row_mask[i])
+                        continue;
+                      auto ky = *(keys + i);
+                      auto &ag = map[ky];
+                      switch (func) {
+                      case Func::SUM:
+                        ag.updateSum(vals[i] * in.row_mask[i]);
+                        break;
+                      case Func::COUNT:
+                        ag.add_row(in.row_mask[i]);
+                        break;
+                      case Func::AVG:
+                        ag.add_row(in.row_mask[i]);
+                        ag.updateSum(vals[i] * in.row_mask[i]);
+                        break;
+                      case Func::MAX:
+                        ag.updateMax(vals[i]);
+                        break;
+                      case Func::MIN:
+                        ag.updateMin(vals[i]);
+                        break;
                       }
+                      // ag.first = std::accumulate(in.row_mask.begin(),
+                      //                            in.row_mask.end(), 0) == 0;
                     }
                   }
                 } else {

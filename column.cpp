@@ -286,7 +286,8 @@ int main(int argc, char *argv[]) {
     std::string colname = std::string(argv[3]);
     auto index = table_schema[colname];
     auto op_string = std::string(argv[4]);
-    std::function<bool(double, double)> op;
+    Ops op;
+
     if (op_string == "==") {
       op = std::equal_to<>{};
     } else if (op_string == "!=") {
@@ -327,9 +328,21 @@ int main(int argc, char *argv[]) {
 
     std::string colname{argv[4]};
     std::string func{argv[3]};
+    Func efunc;
+    if (func == "sum") {
+      efunc = Func::SUM;
+    } else if (func == "count") {
+      efunc = Func::COUNT;
+    } else if (func == "avg") {
+      efunc = Func::AVG;
+    } else if (func == "max") {
+      efunc = Func::MAX;
+    } else if (func == "min") {
+      efunc = Func::MIN;
+    }
     auto scan = std::make_unique<ScanOp>(table);
     auto agg =
-        std::make_unique<AggOp>(std::move(scan), func, table_schema[colname]);
+        std::make_unique<AggOp>(std::move(scan), efunc, table_schema[colname]);
 
     agg->open();
     std::vector<Batch> batches;
@@ -344,16 +357,22 @@ int main(int argc, char *argv[]) {
     }
 
     double d;
-    if (func == "sum") {
+    switch (efunc) {
+    case Func::SUM:
       d = agg->ag.sum;
-    } else if (func == "count") {
+      break;
+    case Func::COUNT:
       d = agg->ag.count;
-    } else if (func == "avg") {
+      break;
+    case Func::AVG:
       d = agg->ag.sum / agg->ag.count;
-    } else if (func == "max") {
+      break;
+    case Func::MAX:
       d = agg->ag.max;
-    } else if (func == "min") {
+      break;
+    case Func::MIN:
       d = agg->ag.min;
+      break;
     }
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(10) << d;
@@ -373,8 +392,20 @@ int main(int argc, char *argv[]) {
     auto agg_id = table_schema[aggcol];
     auto func = std::string(argv[4]);
     auto scan = std::make_unique<ScanOp>(table);
+    Func efunc;
+    if (func == "sum") {
+      efunc = Func::SUM;
+    } else if (func == "count") {
+      efunc = Func::COUNT;
+    } else if (func == "avg") {
+      efunc = Func::AVG;
+    } else if (func == "max") {
+      efunc = Func::MAX;
+    } else if (func == "min") {
+      efunc = Func::MIN;
+    }
     auto groupby =
-        std::make_unique<GroupByOp>(std::move(scan), group_id, agg_id, func);
+        std::make_unique<GroupByOp>(std::move(scan), group_id, agg_id, efunc);
     groupby->open();
     std::vector<Batch> batches;
     Batch in;
@@ -451,7 +482,8 @@ int main(int argc, char *argv[]) {
         std::string colname = std::string(argv[i + 1]);
         auto index = table_schema[colname];
         auto op_string = std::string(argv[i + 2]);
-        std::function<bool(double, double)> op;
+        Ops op;
+
         if (op_string == "==") {
           op = std::equal_to<>{};
         } else if (op_string == "!=") {
@@ -469,6 +501,7 @@ int main(int argc, char *argv[]) {
           return 1;
         }
         auto limit = std::stod(std::string(argv[i + 3]));
+
         root = std::make_unique<FilterOp>(std::move(root), index, op, limit);
         i += 4;
       } else if (std::string_view(argv[i]) == "agg") {
@@ -479,8 +512,19 @@ int main(int argc, char *argv[]) {
 
         std::string colname{argv[i + 2]};
         std::string func = argv[i + 1];
-
-        auto agg = std::make_unique<AggOp>(std::move(root), func,
+        Func efunc;
+        if (func == "sum") {
+          efunc = Func::SUM;
+        } else if (func == "count") {
+          efunc = Func::COUNT;
+        } else if (func == "avg") {
+          efunc = Func::AVG;
+        } else if (func == "max") {
+          efunc = Func::MAX;
+        } else if (func == "min") {
+          efunc = Func::MIN;
+        }
+        auto agg = std::make_unique<AggOp>(std::move(root), efunc,
                                            table_schema[colname]);
         std::vector<Batch> batches;
         Batch in;
@@ -495,16 +539,22 @@ int main(int argc, char *argv[]) {
 
         if (!agg->ag.first) {
           double d;
-          if (func == "sum") {
+          switch (efunc) {
+          case Func::SUM:
             d = agg->ag.sum;
-          } else if (func == "count") {
+            break;
+          case Func::COUNT:
             d = agg->ag.count;
-          } else if (func == "avg") {
+            break;
+          case Func::AVG:
             d = agg->ag.sum / agg->ag.count;
-          } else if (func == "max") {
+            break;
+          case Func::MAX:
             d = agg->ag.max;
-          } else if (func == "min") {
+            break;
+          case Func::MIN:
             d = agg->ag.min;
+            break;
           }
           std::ostringstream oss;
           oss << std::fixed << std::setprecision(10) << d;
@@ -592,8 +642,20 @@ int main(int argc, char *argv[]) {
         auto aggcol = std::string(argv[i + 3]);
         auto agg_id = table_schema[aggcol];
         auto func = std::string(argv[i + 2]);
+        Func efunc;
+        if (func == "sum") {
+          efunc = Func::SUM;
+        } else if (func == "count") {
+          efunc = Func::COUNT;
+        } else if (func == "avg") {
+          efunc = Func::AVG;
+        } else if (func == "max") {
+          efunc = Func::MAX;
+        } else if (func == "min") {
+          efunc = Func::MIN;
+        }
         auto groupby = std::make_unique<GroupByOp>(std::move(root), group_id,
-                                                   agg_id, func);
+                                                   agg_id, efunc);
         groupby->open();
         std::vector<Batch> batches;
         Batch in;
