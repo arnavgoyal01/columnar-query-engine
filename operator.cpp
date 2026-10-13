@@ -24,6 +24,8 @@ void AggState::reset() {
   sum = 0;
   count = 0;
   first = true;
+  max = -pos_inf_double::infinity();
+  min = pos_inf_double::infinity();
 }
 
 bool ScanOp::next(Batch &batch) {
@@ -71,8 +73,9 @@ bool FilterOp::next(Batch &out) {
                   const size_t bound = in.row_mask.size();
                   auto opt = out.row_mask.data();
                   auto ipt = in.row_mask.data();
+                  const auto l = limit;
                   for (int i = 0; i < bound; i++) {
-                    *(opt + i) = op(*(d + i), limit) * *(ipt + i);
+                    *(opt + i) = op(*(d + i), l) * *(ipt + i);
                   }
                 },
                 pred);
@@ -105,16 +108,21 @@ bool AggOp::next(Batch &out) {
           } else {
             const size_t bound = in.row_mask.size();
             const auto ptr = in.row_mask.data();
-            std::vector<double> sums;
-            sums.reserve(bound);
-            const auto sptr = sums.data();
+            double acc1{0.0}, acc2{0.0}, acc3{0.0}, acc4{0.0};
+            size_t j{0};
             switch (func) {
             case Func::SUM:
-              for (int i = 0; i < bound; i++) {
-                *(sptr + i) = *(v + i) * *(ptr + i);
+              for (; j + 3 < bound; j += 4) {
+                acc1 += *(v + j) * *(ptr + j);
+                acc2 += *(v + j + 1) * *(ptr + j + 1);
+                acc3 += *(v + j + 2) * *(ptr + j + 2);
+                acc4 += *(v + j + 3) * *(ptr + j + 3);
               }
-              ag.updateSum(
-                  std::reduce(std::execution::unseq, sptr, sptr + bound, 0.0));
+              acc1 = (acc1 + acc2) + (acc3 + acc4);
+              for (; j < bound; j++) {
+                acc1 += *(v + j) * *(ptr + j);
+              }
+              ag.updateSum(acc1);
               break;
             case Func::COUNT:
               for (int i = 0; i < bound; i++) {
@@ -122,12 +130,22 @@ bool AggOp::next(Batch &out) {
               }
               break;
             case Func::AVG:
-              for (int i = 0; i < bound; i++) {
-                ag.add_row(in.row_mask[i]);
-                *(sptr + i) = *(v + i) * *(ptr + i);
+              for (; j + 3 < bound; j += 4) {
+                acc1 += *(v + j) * *(ptr + j);
+                acc2 += *(v + j + 1) * *(ptr + j + 1);
+                acc3 += *(v + j + 2) * *(ptr + j + 2);
+                acc4 += *(v + j + 3) * *(ptr + j + 3);
+                ag.add_row(*(ptr + j));
+                ag.add_row(*(ptr + j + 1));
+                ag.add_row(*(ptr + j + 2));
+                ag.add_row(*(ptr + j + 3));
               }
-              ag.updateSum(
-                  std::reduce(std::execution::unseq, sptr, sptr + bound, 0.0));
+              acc1 = (acc1 + acc2) + (acc3 + acc4);
+              for (; j < bound; j++) {
+                acc1 += *(v + j) * *(ptr + j);
+                ag.add_row(*(ptr + j));
+              }
+              ag.updateSum(acc1);
               break;
             case Func::MAX:
               for (int i = 0; i < bound; i++) {
